@@ -75,9 +75,13 @@ function create-kubeconfig() {
     mkdir -p $(dirname "${KUBECONFIG}")
     touch "${KUBECONFIG}"
   fi
-  local cluster_args=(
-      "--server=${KUBE_SERVER:-https://${KUBE_MASTER_IP}}"
-  )
+
+  if [[ "${ENABLE_MASTER_HA}" == "true" ]]; then
+    local cluster_args=("--server=${KUBE_SERVER:-https://${KUBE_MASTER_DOMAIN}}")
+  else
+    local cluster_args=("--server=${KUBE_SERVER:-https://${KUBE_MASTER_IP}}")
+  fi
+
   if [[ -z "${CA_CERT:-}" ]]; then
     cluster_args+=("--insecure-skip-tls-verify=true")
   else
@@ -183,7 +187,7 @@ function tear_down_alive_resources() {
 #
 # Vars set:
 #   KUBE_USER
-#   KUBE_PASSWORD
+#   KUBE_PASSWORD/
 #
 # KUBE_USER,KUBE_PASSWORD will be empty if no current-context is set, or
 # the current-context user does not exist or contain basicauth entries.
@@ -596,7 +600,6 @@ DNS_DOMAIN: $(yaml-quote ${DNS_DOMAIN:-})
 KUBELET_TOKEN: $(yaml-quote ${KUBELET_TOKEN:-})
 KUBE_PROXY_TOKEN: $(yaml-quote ${KUBE_PROXY_TOKEN:-})
 ADMISSION_CONTROL: $(yaml-quote ${ADMISSION_CONTROL:-})
-MASTER_IP_RANGE: $(yaml-quote ${MASTER_IP_RANGE})
 RUNTIME_CONFIG: $(yaml-quote ${RUNTIME_CONFIG})
 CA_CERT: $(yaml-quote ${CA_CERT_BASE64:-})
 KUBELET_CERT: $(yaml-quote ${KUBELET_CERT_BASE64:-})
@@ -615,6 +618,7 @@ KUBE_ADDON_REGISTRY: $(yaml-quote ${KUBE_ADDON_REGISTRY:-})
 MULTIZONE: $(yaml-quote ${MULTIZONE:-})
 NON_MASQUERADE_CIDR: $(yaml-quote ${NON_MASQUERADE_CIDR:-})
 KUBE_UID: $(yaml-quote ${KUBE_UID:-})
+ENABLE_MASTER_HA: $(yaml-quote ${ENABLE_MASTER_HA:-false})
 EOF
   if [ -n "${KUBELET_PORT:-}" ]; then
     cat >>$file <<EOF
@@ -800,6 +804,11 @@ EOF
 SCHEDULING_ALGORITHM_PROVIDER: $(yaml-quote ${SCHEDULING_ALGORITHM_PROVIDER})
 EOF
   fi
+  if [ ${ENABLE_MASTER_HA:-false} == false ]; then
+    cat >>$file <<EOF
+MASTER_IP_RANGE: $(yaml-quote ${MASTER_IP_RANGE})
+EOF
+  fi
 }
 
 function sha1sum-file() {
@@ -851,6 +860,41 @@ function create-certs {
   for extra in $@; do
     if [[ -n "${extra}" ]]; then
       sans="${sans}IP:${extra},"
+    fi
+  done
+  sans="${sans}IP:${service_ip},DNS:kubernetes,DNS:kubernetes.default,DNS:kubernetes.default.svc,DNS:kubernetes.default.svc.${DNS_DOMAIN},DNS:${MASTER_NAME}"
+
+  if [ -n "${KUBE_MASTER_DOMAIN:-}" ]; then
+    sans="${sans}, DNS:${KUBE_MASTER_DOMAIN}"
+  fi
+
+  echo "Generating certs for alternate-names: ${sans}"
+
+  PRIMARY_CN="${primary_cn}" SANS="${sans}" generate-certs
+
+  CERT_DIR="${KUBE_TEMP}/easy-rsa-master/easyrsa3"
+  # By default, linux wraps base64 output every 76 cols, so we use 'tr -d' to remove whitespaces.
+  # Note 'base64 -w0' doesn't work on Mac OS X, which has different flags.
+  CA_CERT_BASE64=$(cat "${CERT_DIR}/pki/ca.crt" | base64 | tr -d '\r\n')
+  MASTER_CERT_BASE64=$(cat "${CERT_DIR}/pki/issued/${MASTER_NAME}.crt" | base64 | tr -d '\r\n')
+  MASTER_KEY_BASE64=$(cat "${CERT_DIR}/pki/private/${MASTER_NAME}.key" | base64 | tr -d '\r\n')
+  KUBELET_CERT_BASE64=$(cat "${CERT_DIR}/pki/issued/kubelet.crt" | base64 | tr -d '\r\n')
+  KUBELET_KEY_BASE64=$(cat "${CERT_DIR}/pki/private/kubelet.key" | base64 | tr -d '\r\n')
+  KUBECFG_CERT_BASE64=$(cat "${CERT_DIR}/pki/issued/kubecfg.crt" | base64 | tr -d '\r\n')
+  KUBECFG_KEY_BASE64=$(cat "${CERT_DIR}/pki/private/kubecfg.key" | base64 | tr -d '\r\n')
+}
+
+function create-certs-ha {
+  local -r primary_cn="kubernetes"
+
+  # Determine extra certificate names for master
+  local octets=($(echo "${SERVICE_CLUSTER_IP_RANGE}" | sed -e 's|/.*||' -e 's/\./ /g'))
+  ((octets[3]+=1))
+  local -r service_ip=$(echo "${octets[*]}" | sed 's/ /./g')
+  local sans=""
+  for extra in $@; do
+    if [[ -n "${extra}" ]]; then
+      sans="${sans}${extra},"
     fi
   done
   sans="${sans}IP:${service_ip},DNS:kubernetes,DNS:kubernetes.default,DNS:kubernetes.default.svc,DNS:kubernetes.default.svc.${DNS_DOMAIN},DNS:${MASTER_NAME}"
@@ -927,3 +971,5 @@ function parse-master-env() {
   KUBELET_CERT_BASE64=$(get-env-val "${master_env}" "KUBELET_CERT")
   KUBELET_KEY_BASE64=$(get-env-val "${master_env}" "KUBELET_KEY")
 }
+
+function join_by { local IFS="$1"; shift; echo "$*"; }

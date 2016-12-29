@@ -87,6 +87,10 @@
 {% set params = params + " " + pillar['controller_manager_test_args'] -%}
 {% endif -%}
 
+{% if pillar['leader_elect'] is defined -%}
+{% set params = params + " --leader-elect=true" -%}
+{% endif -%}
+
 {
 "apiVersion": "v1",
 "kind": "Pod",

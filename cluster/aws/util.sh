@@ -94,9 +94,9 @@ load_distro_utils
 
 # This removes the final character in bash (somehow)
 re='[a-zA-Z]'
-if [[ ${ZONE: -1} =~ $re  ]]; then 
+if [[ ${ZONE: -1} =~ $re  ]]; then
   AWS_REGION=${ZONE%?}
-else 
+else
   AWS_REGION=$ZONE
 fi
 
@@ -113,8 +113,28 @@ if [[ -n "${KUBE_SUBNET_CIDR:-}" ]]; then
   echo "Using subnet CIDR override: ${KUBE_SUBNET_CIDR}"
   SUBNET_CIDR=${KUBE_SUBNET_CIDR}
 fi
+
 if [[ -z "${MASTER_INTERNAL_IP-}" ]]; then
   MASTER_INTERNAL_IP="${SUBNET_CIDR%.*}${MASTER_IP_SUFFIX}"
+fi
+
+ENABLE_MASTER_HA=${ENABLE_MASTER_HA:-false}
+
+if [ ${ENABLE_MASTER_HA} == true ]; then
+  NUM_MASTERS=${NUM_MASTERS:-1}
+  AWS_ELB_PROTOCOL=${AWS_ELB_PROTOCOL:-HTTPS}
+  AWS_ELB_PORT=${AWS_ELB_PORT:-443}
+  MASTER_INTERNAL_IPS=${MASTER_INTERNAL_IP}
+  MASTER_IP_SUFFIX_START=${MASTER_INTERNAL_IP##*.}
+
+  if [[ ${NUM_MASTERS} -ge 2 ]]; then
+    for ((i=1; i < ${NUM_MASTERS}; i++)); do
+      MASTER_INTERNAL_IPS[$i]="${MASTER_INTERNAL_IP%.*}.`expr ${MASTER_IP_SUFFIX_START} + $i`"
+    done
+    INITIAL_ETCD_CLUSTER=("${MASTER_INTERNAL_IPS[@]//./-}")
+    INITIAL_ETCD_CLUSTER=("${INITIAL_ETCD_CLUSTER[@]/#/ip-}")
+    INITIAL_ETCD_CLUSTER=$(join_by , ${INITIAL_ETCD_CLUSTER[@]})
+  fi
 fi
 
 MASTER_SG_NAME="kubernetes-master-${CLUSTER_ID}"
@@ -203,7 +223,14 @@ function get_security_group_id {
 function find-tagged-master-ip {
   find-master-pd
   if [[ -n "${MASTER_DISK_ID:-}" ]]; then
-    KUBE_MASTER_IP=$(get-tag ${MASTER_DISK_ID} ${TAG_KEY_MASTER_IP})
+    MASTER_DISK_ID=(${MASTER_DISK_ID[@]})
+    if [[ ${#MASTER_DISK_ID[@]} -ge 2 ]]; then
+      for ((i=0; i < ${#MASTER_DISK_ID[@]}; i++)); do
+        KUBE_MASTER_IP[$i]=$(get-tag ${MASTER_DISK_ID[$i]} ${TAG_KEY_MASTER_IP})
+      done
+    else
+      KUBE_MASTER_IP=$(get-tag ${MASTER_DISK_ID} ${TAG_KEY_MASTER_IP})
+    fi
   fi
 }
 
@@ -461,7 +488,9 @@ function find-master-pd {
 function ensure-master-pd {
   local name=${MASTER_NAME}-pd
 
-  find-master-pd
+  if [ ! ${1:-} ]; then
+    find-master-pd
+  fi
 
   if [[ -z "${MASTER_DISK_ID}" ]]; then
     echo "Creating master disk: size ${MASTER_DISK_SIZE}GB, type ${MASTER_DISK_TYPE}"
@@ -948,8 +977,11 @@ function kube-up {
     wait-minions
   else
     # Create the master
-    start-master
-
+    if [ ${ENABLE_MASTER_HA} == true ]; then
+      start-masters
+    else
+      start-master
+    fi
     # Build ~/.kube/config
     build-config
 
@@ -997,10 +1029,6 @@ function start-master() {
   # We have to make sure that the cert is valid for API_SERVERS
   # i.e. we likely have to pass ELB name / elastic IP in future
   create-certs "${KUBE_MASTER_IP}" "${MASTER_INTERNAL_IP}"
-
-  # This key is no longer needed, and this enables us to get under the 16KB size limit
-  KUBECFG_CERT_BASE64=""
-  KUBECFG_KEY_BASE64=""
 
   write-master-env
 
@@ -1091,6 +1119,127 @@ function start-master() {
   done
 }
 
+# Starts the master nodes
+function start-masters() {
+  # Ensure RUNTIME_CONFIG is populated
+  build-runtime-config
+
+  create-load-balancer
+  create-certs-ha "DNS:${KUBE_MASTER_DOMAIN}"
+  set-elb-health-check
+
+  # This key is no longer needed, and this enables us to get under the 16KB size limit
+  KUBECFG_CERT_BASE64=""
+  KUBECFG_KEY_BASE64=""
+
+  for ((i=0; i<${#MASTER_INTERNAL_IPS[@]}; i++)); do
+    local internal_ip=${MASTER_INTERNAL_IPS[$i]}
+    local master_ip_range=$(get-master-ip-range $i)
+
+    MASTER_DISK_ID=""
+    KUBE_MASTER_IP=""
+
+    # Get or create master persistent volume
+    ensure-master-pd true
+
+    # Get or create master elastic IP
+    # ensure-master-ip
+
+    write-master-env
+
+    (
+      # We pipe this to the ami as a startup script in the user-data field.  Requires a compatible ami
+      echo "#! /bin/bash"
+      echo "mkdir -p /var/cache/kubernetes-install"
+      echo "cd /var/cache/kubernetes-install"
+
+      echo "cat > kube_env.yaml << __EOF_MASTER_KUBE_ENV_YAML"
+      cat ${KUBE_TEMP}/master-kube-env.yaml
+      echo "AUTO_UPGRADE: 'true'"
+      # TODO: get rid of these exceptions / harmonize with common or GCE
+      echo "MASTER_IP_RANGE: $(yaml-quote ${master_ip_range:-})"
+      echo "DOCKER_STORAGE: $(yaml-quote ${DOCKER_STORAGE:-})"
+      echo "API_SERVERS: $(yaml-quote ${KUBE_MASTER_DOMAIN:-})"
+      echo "__EOF_MASTER_KUBE_ENV_YAML"
+      echo ""
+      echo "wget -O bootstrap ${BOOTSTRAP_SCRIPT_URL}"
+      echo "chmod +x bootstrap"
+      echo "mkdir -p /etc/kubernetes"
+      echo "mv kube_env.yaml /etc/kubernetes"
+      echo "mv bootstrap /etc/kubernetes/"
+      echo "cat > /etc/rc.local << EOF_RC_LOCAL"
+      echo "#!/bin/sh -e"
+      # We want to be sure that we don't pass an argument to bootstrap
+      echo "/etc/kubernetes/bootstrap"
+      echo "exit 0"
+      echo "EOF_RC_LOCAL"
+      echo "/etc/kubernetes/bootstrap"
+    ) > "${KUBE_TEMP}/master-user-data"
+
+    # Compress the data to fit under the 16KB limit (cloud-init accepts compressed data)
+    gzip "${KUBE_TEMP}/master-user-data"
+
+    echo "Starting Master"
+    master_id=$($AWS_CMD run-instances \
+      --image-id $AWS_IMAGE \
+      --iam-instance-profile Name=$IAM_PROFILE_MASTER \
+      --instance-type $MASTER_SIZE \
+      --subnet-id $SUBNET_ID \
+      --private-ip-address ${internal_ip} \
+      --key-name ${AWS_SSH_KEY_NAME} \
+      --security-group-ids ${MASTER_SG_ID} \
+      --associate-public-ip-address \
+      --block-device-mappings "${MASTER_BLOCK_DEVICE_MAPPINGS}" \
+      --user-data fileb://${KUBE_TEMP}/master-user-data.gz \
+      --query Instances[].InstanceId)
+    add-tag $master_id Name $MASTER_NAME
+    add-tag $master_id Role $MASTER_TAG
+    add-tag $master_id KubernetesCluster ${CLUSTER_ID}
+
+    echo "Waiting for master to be ready"
+    local attempt=0
+
+    while true; do
+      echo -n Attempt "$(($attempt+1))" to check for master node
+      local ip=$(get_instance_public_ip ${master_id})
+      if [[ -z "${ip}" ]]; then
+        if (( attempt > 30 )); then
+          echo
+          echo -e "${color_red}master failed to start. Your cluster is unlikely" >&2
+          echo "to work correctly. Please run ./cluster/kube-down.sh and re-create the" >&2
+          echo -e "cluster. (sorry!)${color_norm}" >&2
+          exit 1
+        fi
+      else
+        # We are not able to add an elastic ip, a route or volume to the instance until that instance is in "running" state.
+        wait-for-instance-state ${master_id} "running"
+
+        KUBE_MASTER=${MASTER_NAME}
+        echo -e " ${color_green}[master #$((${i}+1)) running]${color_norm}"
+
+        #attach-ip-to-instance ${KUBE_MASTER_IP} ${master_id}
+
+        # This is a race between instance start and volume attachment.  There appears to be no way to start an AWS instance with a volume attached.
+        # To work around this, we wait for volume to be ready in setup-master-pd.sh
+        echo "Attaching persistent data volume (${MASTER_DISK_ID}) to master"
+        $AWS_CMD attach-volume --volume-id ${MASTER_DISK_ID} --device /dev/sdb --instance-id ${master_id}
+
+        sleep 10
+        $AWS_CMD create-route --route-table-id $ROUTE_TABLE_ID --destination-cidr-block ${master_ip_range} --instance-id $master_id > $LOG
+
+        add-instance-to-load-balancer ${master_id}
+
+        rm ${KUBE_TEMP}/master-user-data.gz
+
+        break
+      fi
+      echo -e " ${color_yellow}[master not working yet]${color_norm}"
+      attempt=$(($attempt+1))
+      sleep 10
+    done
+  done
+}
+
 # Creates an ASG for the minion nodes
 function start-minions() {
   # Minions don't currently use runtime config, but call it anyway for sanity
@@ -1099,6 +1248,12 @@ function start-minions() {
   echo "Creating minion configuration"
 
   write-node-env
+
+  if [ -n "${KUBE_MASTER_DOMAIN:-}" ]; then
+    local api_servers="${KUBE_MASTER_DOMAIN}"
+  else
+    local api_servers="${MASTER_INTERNAL_IP}"
+  fi
 
   (
     # We pipe this to the ami as a startup script in the user-data field.  Requires a compatible ami
@@ -1110,7 +1265,7 @@ function start-minions() {
     echo "AUTO_UPGRADE: 'true'"
     # TODO: get rid of these exceptions / harmonize with common or GCE
     echo "DOCKER_STORAGE: $(yaml-quote ${DOCKER_STORAGE:-})"
-    echo "API_SERVERS: $(yaml-quote ${MASTER_INTERNAL_IP:-})"
+    echo "API_SERVERS: $(yaml-quote ${api_servers:-})"
     echo "__EOF_KUBE_ENV_YAML"
     echo ""
     echo "wget -O bootstrap ${BOOTSTRAP_SCRIPT_URL}"
@@ -1200,7 +1355,13 @@ function wait-minions {
 
 # Wait for the master to be started
 function wait-master() {
-  detect-master > $LOG
+  local ip=
+  if [ ${ENABLE_MASTER_HA} == true ]; then
+    ip=${KUBE_MASTER_DOMAIN}
+  else
+    detect-master > $LOG
+    ip=${KUBE_MASTER_IP}
+  fi
 
   echo "Waiting for cluster initialization."
   echo
@@ -1209,8 +1370,12 @@ function wait-master() {
   echo "  up."
   echo
 
+  if [ ${ENABLE_MASTER_HA} == true ]; then
+    echo "High Availability Master Configure is enabled. It will take more time than normal"
+  fi
+
   until $(curl --insecure --user ${KUBE_USER}:${KUBE_PASSWORD} --max-time 5 \
-    --fail --output $LOG --silent https://${KUBE_MASTER_IP}/healthz); do
+    --fail --output $LOG --silent https://${ip}/healthz); do
     printf "."
     sleep 2
   done
@@ -1278,7 +1443,11 @@ function check-cluster() {
   echo
   echo -e "${color_green}Kubernetes cluster is running.  The master is running at:"
   echo
-  echo -e "${color_yellow}  https://${KUBE_MASTER_IP}"
+  if [ ${ENABLE_MASTER_HA} == true ]; then
+    echo -e "${color_yellow}  https://${KUBE_MASTER_DOMAIN}"
+  else
+    echo -e "${color_yellow}  https://${KUBE_MASTER_IP}"
+  fi
   echo
   echo -e "${color_green}The user name and password to use is located in ${KUBECONFIG}.${color_norm}"
   echo
@@ -1306,6 +1475,11 @@ function kube-down {
           sleep 3
         fi
       done
+    fi
+
+    find-cert
+    if [ -n "${AWS_ELB_CERT_ARN:-}" ]; then
+      delete-server-certificate
     fi
 
     if [[ -z "${KUBE_MASTER_ID-}" ]]; then
@@ -1349,16 +1523,31 @@ function kube-down {
       ${AWS_ASG_CMD} delete-launch-configuration --launch-configuration-name ${ASG_NAME} || true
     fi
 
-    find-master-pd
+    #find-master-pd
     find-tagged-master-ip
 
     if [[ -n "${KUBE_MASTER_IP:-}" ]]; then
-      release-elastic-ip ${KUBE_MASTER_IP}
+      if [ ${#KUBE_MASTER_IP} -ge 2 ]; then
+        for ip in ${KUBE_MASTER_IP[@]}; do
+          if [[ -n "${ip}" ]]; then
+            release-elastic-ip ${ip}
+          fi
+        done
+      else
+        release-elastic-ip ${KUBE_MASTER_IP}
+      fi
     fi
 
     if [[ -n "${MASTER_DISK_ID:-}" ]]; then
-      echo "Deleting volume ${MASTER_DISK_ID}"
-      $AWS_CMD delete-volume --volume-id ${MASTER_DISK_ID} > $LOG
+      if [ ${#MASTER_DISK_ID} -ge 2 ]; then
+        for id in ${MASTER_DISK_ID[@]}; do
+          echo "Deleting volume ${id}"
+          $AWS_CMD delete-volume --volume-id ${id} > $LOG
+        done
+      else
+        echo "Deleting volume ${MASTER_DISK_ID}"
+        $AWS_CMD delete-volume --volume-id ${MASTER_DISK_ID} > $LOG
+      fi
     fi
 
     echo "Cleaning up resources in VPC: ${vpc_id}"
@@ -1449,7 +1638,7 @@ function kube-down {
 }
 
 # Update a kubernetes cluster with latest source
-function kube-push {
+function kube-push { # TODO: apply master HA
   detect-master
 
   # Make sure we have the tar files staged on Google Storage
@@ -1571,4 +1760,46 @@ function prepare-e2e() {
 function get-tokens() {
   KUBELET_TOKEN=$(dd if=/dev/urandom bs=128 count=1 2>/dev/null | base64 | tr -d "=+/" | dd bs=32 count=1 2>/dev/null)
   KUBE_PROXY_TOKEN=$(dd if=/dev/urandom bs=128 count=1 2>/dev/null | base64 | tr -d "=+/" | dd bs=32 count=1 2>/dev/null)
+}
+
+function create-load-balancer {
+  echo "Creating ELB."
+
+  MASTER_ELB_DOMAIN=$(aws elb create-load-balancer \
+    --load-balancer-name ${CLUSTER_ID} \
+    --listeners "Protocol=TCP,LoadBalancerPort=443,InstanceProtocol=TCP,InstancePort=443" \
+    --subnets "${SUBNET_ID}" \
+    --security-groups "${MASTER_SG_ID}")
+
+  echo "ELB Created : ${MASTER_ELB_DOMAIN}"
+
+  if [ -z "${KUBE_MASTER_DOMAIN:-}" ]; then
+    KUBE_MASTER_DOMAIN="${MASTER_ELB_DOMAIN}"
+  fi
+
+}
+
+function set-elb-health-check {
+  aws elb configure-health-check --load-balancer-name ${CLUSTER_ID} --health-check Target=TCP:${AWS_ELB_PORT},Interval=30,UnhealthyThreshold=2,HealthyThreshold=10,Timeout=5
+}
+
+function add-instance-to-load-balancer {
+  echo "Adding instance(${1}) to ELB."
+
+  local result=$(aws elb register-instances-with-load-balancer \
+    --load-balancer-name ${CLUSTER_ID} \
+    --instances $1)
+}
+
+function get-master-ip-range {
+  local i=$1
+
+  local ip1=
+  local ip2=
+  local ip3=
+  local ip4=
+
+  IFS=. read ip1 ip2 ip3 ip4 <<< "${MASTER_IP_RANGE}"
+  ip3=$(($ip3+$i))
+  echo "$ip1.$ip2.$ip3.$ip4"
 }

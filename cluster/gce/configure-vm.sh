@@ -589,6 +589,11 @@ EOF
 scheduling_algorithm_provider: '$(echo "${SCHEDULING_ALGORITHM_PROVIDER}" | sed -e "s/'/''/g")'
 EOF
     fi
+    if [ "${ENABLE_MASTER_HA:-}" == "true" ]; then
+      cat <<EOF >>/srv/salt-overlay/pillar/cluster-params.sls
+leader-elect: true
+EOF
+    fi
 }
 
 # The job of this function is simple, but the basic regular expression syntax makes
